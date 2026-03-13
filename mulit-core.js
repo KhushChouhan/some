@@ -10,7 +10,7 @@ const RESOURCE_ID = '35985678-0d79-46b4-9ed6-6f13308a1d24'
 const LIMIT = 5000
 const CHUNK_SIZE = 500000
 const FOLDER_ID = '1TNYEd-5CCzypE-mYfSsBH7yzr9iH7_Z2'
-const NUM_WORKERS = 5 // Workers kam rakhein stable connection ke liye
+const NUM_WORKERS = 4 // Workers kam rakhein stable connection ke liye
 
 const STORAGE_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || './data'
 
