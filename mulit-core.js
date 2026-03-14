@@ -11,12 +11,12 @@ const MONGO_URI =
   process.env.MONGO_URI ||
   'mongodb+srv://khushchouhan9680_db_user:9680796461@cluster0.2xwtrmi.mongodb.net/mandi_scraper?retryWrites=true&w=majority'
 const FOLDER_ID = '1TNYEd-5CCzypE-mYfSsBH7yzr9iH7_Z2'
-const LIMIT = 5000
+const LIMIT = 2000 // Stable performance ke liye 2000 rakha hai
 
 const YEARS = Array.from({ length: 25 }, (_, i) => (2002 + i).toString())
 
 const progressSchema = new mongoose.Schema({
-  id: { type: String, default: 'scraper_progress_v2' },
+  id: { type: String, default: 'scraper_progress_v3' }, // V3 for clean start
   yearIndex: { type: Number, default: 0 },
   offset: { type: Number, default: 0 },
 })
@@ -27,14 +27,26 @@ function sleep(ms) {
 }
 
 async function fetchData(offset, year) {
-  const url = `https://api.data.gov.in/resource/${RESOURCE_ID}?api-key=${API_KEY}&format=json&limit=${LIMIT}&offset=${offset}&filters[arrival_date]=*${year}`
+  // sort add karne se API query stable ho jati hai
+  const url = `https://api.data.gov.in/resource/${RESOURCE_ID}?api-key=${API_KEY}&format=json&limit=${LIMIT}&offset=${offset}&filters[arrival_date]=*${year}&sort[arrival_date]=asc`
+
   while (true) {
     try {
-      const res = await axios.get(url, { timeout: 60000 })
+      const res = await axios.get(url, { timeout: 90000 }) // 90 seconds timeout
       return res.data.records || []
     } catch (err) {
-      process.stdout.write(`\n⏳ API Busy for Year ${year}. Retrying...`)
-      await sleep(30000)
+      const time = new Date().toLocaleTimeString()
+      if (err.response && err.response.status === 429) {
+        process.stdout.write(
+          `\n🚫 [${time}] Rate Limit Hit! Sleeping for 60s...`,
+        )
+        await sleep(60000)
+      } else {
+        process.stdout.write(
+          `\n⏳ [${time}] API Busy or Timeout for Year ${year}. Retrying...`,
+        )
+        await sleep(20000)
+      }
     }
   }
 }
@@ -56,9 +68,8 @@ async function uploadYearlyFile(drive, pass, year) {
 
 async function start() {
   await mongoose.connect(MONGO_URI)
-  console.log(`🚀 GLOBAL YEAR-WISE SCRAPER STARTED!`)
+  console.log(`🚀 STABLE YEAR-WISE SCRAPER STARTED! (2002lkdflksdlf - 2026)`)
 
-  // --- AUTH LOGIC (VARIABLE + FILE SUPPORT) ---
   let credentials, token
   try {
     if (process.env.GOOGLE_CREDENTIALS) {
@@ -71,7 +82,7 @@ async function start() {
       console.log('📁 Using Auth from Local Files.')
     }
   } catch (e) {
-    console.error('❌ FATAL ERROR: Auth data missing (Variables or Files)!')
+    console.error('❌ FATAL ERROR: Auth data missing!')
     process.exit(1)
   }
 
@@ -84,8 +95,8 @@ async function start() {
   oAuth2Client.setCredentials(token)
   const drive = google.drive({ version: 'v3', auth: oAuth2Client })
 
-  let prog = await Progress.findOne({ id: 'scraper_progress_v2' })
-  if (!prog) prog = await Progress.create({ id: 'scraper_progress_v2' })
+  let prog = await Progress.findOne({ id: 'scraper_progress_v3' })
+  if (!prog) prog = await Progress.create({ id: 'scraper_progress_v3' })
 
   let { yearIndex, offset } = prog
 
@@ -102,47 +113,51 @@ async function start() {
 
     while (true) {
       const records = await fetchData(offset, currentYear)
+
       if (records.length === 0) {
-        await sleep(15000)
+        await sleep(10000) // Verification delay
         const check = await fetchData(offset, currentYear)
         if (check.length === 0) break
       }
 
       yearRowCount += records.length
       process.stdout.write(
-        `\r[${new Date().toLocaleTimeString()}] 📥 Year ${currentYear}: +${records.length} | Total: ${yearRowCount} | Offset: ${offset}`,
+        `\r[${new Date().toLocaleTimeString()}] 📥 Year ${currentYear}: Total ${yearRowCount.toLocaleString()} | Offset: ${offset}`,
       )
 
       if (!headerWritten) {
         pass.write(Object.keys(records[0]).join(',') + '\n')
         headerWritten = true
       }
-      pass.write(
-        records
-          .map((r) =>
-            Object.values(r)
-              .map((v) => `"${v}"`)
-              .join(','),
-          )
-          .join('\n') + '\n',
-      )
+
+      const rows = records
+        .map((r) =>
+          Object.values(r)
+            .map((v) => `"${v}"`)
+            .join(','),
+        )
+        .join('\n')
+      pass.write(rows + '\n')
 
       offset += LIMIT
       await Progress.updateOne(
-        { id: 'scraper_progress_v2' },
+        { id: 'scraper_progress_v3' },
         { offset, yearIndex },
       )
-      await sleep(1500)
+
+      await sleep(2000) // API ko saans lene ke liye 2s delay
     }
 
     pass.end()
     await uploadPromise
+
     yearIndex++
     offset = 0
     await Progress.updateOne(
-      { id: 'scraper_progress_v2' },
+      { id: 'scraper_progress_v3' },
       { yearIndex, offset: 0 },
     )
+    console.log(`\n🎉 Year ${currentYear} Finished!`)
   }
   console.log('\n🏁 MISSION COMPLETE!')
 }
