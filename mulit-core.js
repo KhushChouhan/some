@@ -9,7 +9,6 @@ const API_KEY =
   process.env.DATA_GOV_API_KEY ||
   '579b464db66ec23bdd000001e8d75b7cb11147365a5647630c56832b'
 const RESOURCE_ID = '35985678-0d79-46b4-9ed6-6f13308a1d24'
-// Aapka MongoDB Connection String
 const MONGO_URI =
   process.env.MONGO_URI ||
   'mongodb+srv://khushchouhan9680_db_user:9680796461@cluster0.2xwtrmi.mongodb.net/mandi_scraper?retryWrites=true&w=majority'
@@ -32,7 +31,6 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms))
 }
 
-// --- INFINITE RETRY FETCH ---
 async function fetchData(offset) {
   const url = `https://api.data.gov.in/resource/${RESOURCE_ID}?api-key=${API_KEY}&format=json&limit=${LIMIT}&offset=${offset}`
   while (true) {
@@ -70,12 +68,11 @@ async function start() {
   await mongoose.connect(MONGO_URI)
   console.log(`✅ MongoDB Connected!`)
 
-  // Progress Loading Logic
+  // --- PROGRESS LOGIC ---
   let state = await Progress.findOne({ id: 'scraper_progress' })
-
   if (!state) {
     console.log(
-      '📍 No previous progress found. Starting from Part 4 / Offset 15,00,000 as requested.',
+      '📍 No previous progress found. Starting from Part 4 / Offset 15,00,000.',
     )
     state = await Progress.create({
       id: 'scraper_progress',
@@ -85,9 +82,26 @@ async function start() {
     })
   }
 
-  // Auth setup (Drive)
-  let credentials = JSON.parse(fs.readFileSync('credentials.json'))
-  let token = JSON.parse(fs.readFileSync('token.json'))
+  // --- DYNAMIC AUTH SETUP ---
+  let credentials, token
+  try {
+    // Railway Variables se check karega, nahi toh local file se
+    credentials = process.env.GOOGLE_CREDENTIALS
+      ? JSON.parse(process.env.GOOGLE_CREDENTIALS)
+      : JSON.parse(fs.readFileSync('credentials.json', 'utf8'))
+
+    token = process.env.GOOGLE_TOKEN
+      ? JSON.parse(process.env.GOOGLE_TOKEN)
+      : JSON.parse(fs.readFileSync('token.json', 'utf8'))
+
+    console.log('🔑 Auth Credentials loaded successfully.')
+  } catch (e) {
+    console.error(
+      '❌ FATAL: Credentials or Token missing in Variables AND Files!',
+    )
+    process.exit(1)
+  }
+
   const { client_secret, client_id, redirect_uris } =
     credentials.installed || credentials.web
   const oAuth2Client = new google.auth.OAuth2(
@@ -103,7 +117,7 @@ async function start() {
   let pass = new stream.PassThrough()
 
   console.log(
-    `📍 Resuming from DB -> Offset: ${offset} | Part: ${part} | Rows in Chunk: ${rowCount}`,
+    `📍 Resuming from DB -> Offset: ${offset} | Part: ${part} | Chunk: ${rowCount}`,
   )
 
   while (true) {
@@ -146,7 +160,6 @@ async function start() {
     offset += NUM_WORKERS * LIMIT
     rowCount += allRecords.length
 
-    // Save to MongoDB every batch
     await Progress.updateOne(
       { id: 'scraper_progress' },
       { offset, rowCount, part },
@@ -159,15 +172,12 @@ async function start() {
     if (rowCount >= CHUNK_SIZE) {
       pass.end()
       await uploadChunk(drive, pass, part)
-
       part++
       rowCount = 0
-      // Update DB for new part
       await Progress.updateOne(
         { id: 'scraper_progress' },
         { part, rowCount: 0 },
       )
-
       pass = new stream.PassThrough()
       headerWritten = false
     }
