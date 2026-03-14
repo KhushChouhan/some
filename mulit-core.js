@@ -5,48 +5,44 @@ const { google } = require('googleapis')
 const mongoose = require('mongoose')
 
 // --- CONFIGURATION ---
-const API_KEY = '579b464db66ec23bdd000001e168306278c84e916ff43065bb362867' // Nayi Key Updated
+const API_KEY = '579b464db66ec23bdd000001e168306278c84e916ff43065bb362867'
 const RESOURCE_ID = '35985678-0d79-46b4-9ed6-6f13308a1d24'
 const MONGO_URI = process.env.MONGO_URI || 'mongodb+srv://khushchouhan9680_db_user:9680796461@cluster0.2xwtrmi.mongodb.net/mandi_scraper?retryWrites=true&w=majority'
 const FOLDER_ID = '1TNYEd-5CCzypE-mYfSsBH7yzr9iH7_Z2'
 const LIMIT = 5000
 
-const STATES = [
-  "Andaman and Nicobar", "Andhra Pradesh", "Arunachal Pradesh", "Assam", "Bihar",
-  "Chandigarh", "Chattisgarh", "Dadra and Nagar Haveli", "Daman and Diu", "Delhi",
-  "Goa", "Gujarat", "Haryana", "Himachal Pradesh", "Jammu and Kashmir", "Jharkhand",
-  "Karnataka", "Kerala", "Madhya Pradesh", "Maharashtra", "Manipur", "Meghalaya",
-  "Mizoram", "Nagaland", "Odisha", "Puducherry", "Punjab", "Rajasthan", "Sikkim",
-  "Tamil Nadu", "Telangana", "Tripura", "Uttar Pradesh", "Uttrakhand", "West Bengal"
-]
+// 2002 se 2026 tak ke saal ki list
+const YEARS = Array.from({length: 25}, (_, i) => (2002 + i).toString());
 
 const progressSchema = new mongoose.Schema({
-  id: { type: String, default: 'scraper_progress' },
-  stateIndex: { type: Number, default: 0 },
+  id: { type: String, default: 'scraper_progress_v2' }, // V2 for Year-wise
+  yearIndex: { type: Number, default: 0 },
   offset: { type: Number, default: 0 }
 })
 const Progress = mongoose.model('Progress', progressSchema)
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)) }
 
-// --- FETCH DATA WITH INFINITE RETRY ---
-async function fetchData(offset, stateName) {
-  const url = `https://api.data.gov.in/resource/${RESOURCE_ID}?api-key=${API_KEY}&format=json&limit=${LIMIT}&offset=${offset}&filters[state]=${encodeURIComponent(stateName)}`
+// --- FETCH DATA BY YEAR ---
+async function fetchData(offset, year) {
+  // Wildcard '*' use kiya hai taaki date mein kahin bhi saal match ho jaye
+  const url = `https://api.data.gov.in/resource/${RESOURCE_ID}?api-key=${API_KEY}&format=json&limit=${LIMIT}&offset=${offset}&filters[arrival_date]=*${year}`
+
   while (true) {
     try {
       const res = await axios.get(url, { timeout: 60000 })
       return res.data.records || []
     } catch (err) {
-      process.stdout.write(`\n⏳ [${new Date().toLocaleTimeString()}] API Busy at ${stateName}. Retrying...`)
+      process.stdout.write(`\n⏳ [${new Date().toLocaleTimeString()}] API Busy for Year ${year}. Retrying in 30s...`)
       await sleep(30000)
     }
   }
 }
 
 // --- GOOGLE DRIVE UPLOAD ---
-async function uploadChunk(drive, pass, stateName) {
+async function uploadYearlyFile(drive, pass, year) {
   try {
-    const fileName = `mandi_${stateName.replace(/ /g, '_')}_FULL.csv`;
+    const fileName = `mandi_all_states_${year}.csv`;
     const res = await drive.files.create({
       requestBody: { name: fileName, parents: [FOLDER_ID] },
       media: { mimeType: 'text/csv', body: pass },
@@ -61,18 +57,22 @@ async function uploadChunk(drive, pass, stateName) {
 
 async function start() {
   await mongoose.connect(MONGO_URI)
-  console.log(`🚀 Scraper Started! Har State ki alag file Google Drive par jayegi.\n`)
+  console.log(`🚀 GLOBAL YEAR-WISE SCRAPER STARTED! (2002 - 2026)`)
+  console.log(`📊 Target: 7.7 Crore Historical Records\n`)
 
-  let prog = await Progress.findOne({ id: 'scraper_progress' })
-  if (!prog) prog = await Progress.create({ id: 'scraper_progress' })
+  let prog = await Progress.findOne({ id: 'scraper_progress_v2' })
+  if (!prog) {
+    prog = await Progress.create({ id: 'scraper_progress_v2', yearIndex: 0, offset: 0 })
+    console.log("🆕 New Progress initialized at Year 2002.")
+  }
 
-  // Auth setup (Local files or Env)
+  // Auth setup
   let credentials, token;
   try {
     credentials = process.env.GOOGLE_CREDENTIALS ? JSON.parse(process.env.GOOGLE_CREDENTIALS) : JSON.parse(fs.readFileSync('credentials.json', 'utf8'));
     token = process.env.GOOGLE_TOKEN ? JSON.parse(process.env.GOOGLE_TOKEN) : JSON.parse(fs.readFileSync('token.json', 'utf8'));
   } catch (e) {
-    console.error('❌ Error: credentials.json or token.json missing locally!');
+    console.error('❌ Error: credentials.json or token.json missing!');
     process.exit(1);
   }
 
@@ -81,32 +81,30 @@ async function start() {
   oAuth2Client.setCredentials(token)
   const drive = google.drive({ version: 'v3', auth: oAuth2Client })
 
-  let { stateIndex, offset } = prog
+  let { yearIndex, offset } = prog
 
-  while (stateIndex < STATES.length) {
-    const currentState = STATES[stateIndex]
-    console.log(`\n🌍 --- Processing State: ${currentState} (${stateIndex + 1}/${STATES.length}) ---`)
+  while (yearIndex < YEARS.length) {
+    const currentYear = YEARS[yearIndex]
+    console.log(`\n📅 --- Processing Year: ${currentYear} (${yearIndex + 1}/${YEARS.length}) ---`)
 
     let pass = new stream.PassThrough()
     let headerWritten = false
-    let stateRowCount = 0
+    let yearRowCount = 0
 
-    // Nayi file ka upload stream shuru karein
-    const uploadPromise = uploadChunk(drive, pass, currentState)
+    // Start upload stream for the year
+    const uploadPromise = uploadYearlyFile(drive, pass, currentYear)
 
     while (true) {
-      const records = await fetchData(offset, currentState)
+      const records = await fetchData(offset, currentYear)
 
       if (records.length === 0) {
-        // Double check taaki data miss na ho
-        await sleep(20000)
-        const check = await fetchData(offset, currentState)
+        await sleep(15000) // Double check delay
+        const check = await fetchData(offset, currentYear)
         if (check.length === 0) break
       }
 
-      // --- LIVE CONSOLE LOGGING ---
-      stateRowCount += records.length;
-      console.log(`[${new Date().toLocaleTimeString()}] 📥 Received: +${records.length} rows | Total for ${currentState}: ${stateRowCount} | Offset: ${offset}`);
+      yearRowCount += records.length;
+      process.stdout.write(`\r[${new Date().toLocaleTimeString()}] 📥 Year ${currentYear}: +${records.length} | Total: ${yearRowCount.toLocaleString()} | Offset: ${offset}`);
 
       if (!headerWritten) {
         pass.write(Object.keys(records[0]).join(',') + '\n')
@@ -117,25 +115,25 @@ async function start() {
       pass.write(rows + '\n')
 
       offset += LIMIT
+      // Update progress
+      await Progress.updateOne({ id: 'scraper_progress_v2' }, { offset, yearIndex })
 
-      // Update progress in DB
-      await Progress.updateOne({ id: 'scraper_progress' }, { offset, stateIndex })
-
-      await sleep(2000) // Delay to prevent IP block
+      await sleep(1500) // Safety delay
     }
 
-    // State khatam, stream close karein
+    // Finish year file
     pass.end()
     await uploadPromise
 
-    console.log(`\n🎉 Finished ${currentState}. Moving to next state...`)
+    console.log(`\n🎉 Finished Year ${currentYear}. Moving to next...`)
 
-    // Agli state ke liye reset
-    stateIndex++
+    // Move to next year
+    yearIndex++
     offset = 0
-    await Progress.updateOne({ id: 'scraper_progress' }, { stateIndex, offset: 0 })
+    await Progress.updateOne({ id: 'scraper_progress_v2' }, { yearIndex, offset: 0 })
   }
-  console.log("\n🏁 MISSION ACCOMPLISHED: 7.7 CR DATA SCRAPED STATE-WISE!")
+
+  console.log("\n🏁 MISSION ACCOMPLISHED: ALL DATA FROM 2002-2026 SCRAPED!")
 }
 
 start().catch(err => console.error(err))
