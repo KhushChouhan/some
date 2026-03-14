@@ -5,191 +5,137 @@ const { google } = require('googleapis')
 const mongoose = require('mongoose')
 
 // --- CONFIGURATION ---
-const API_KEY =
-  process.env.DATA_GOV_API_KEY ||
-  '579b464db66ec23bdd000001e8d75b7cb11147365a5647630c56832b'
+const API_KEY = '579b464db66ec23bdd000001e168306278c84e916ff43065bb362867' // Nayi Key Updated
 const RESOURCE_ID = '35985678-0d79-46b4-9ed6-6f13308a1d24'
-const MONGO_URI =
-  process.env.MONGO_URI ||
-  'mongodb+srv://khushchouhan9680_db_user:9680796461@cluster0.2xwtrmi.mongodb.net/mandi_scraper?retryWrites=true&w=majority'
-
-const LIMIT = 5000
-const CHUNK_SIZE = 500000
+const MONGO_URI = process.env.MONGO_URI || 'mongodb+srv://khushchouhan9680_db_user:9680796461@cluster0.2xwtrmi.mongodb.net/mandi_scraper?retryWrites=true&w=majority'
 const FOLDER_ID = '1TNYEd-5CCzypE-mYfSsBH7yzr9iH7_Z2'
-const NUM_WORKERS = 2
+const LIMIT = 5000
 
-// --- MONGODB SCHEMA ---
+const STATES = [
+  "Andaman and Nicobar", "Andhra Pradesh", "Arunachal Pradesh", "Assam", "Bihar",
+  "Chandigarh", "Chattisgarh", "Dadra and Nagar Haveli", "Daman and Diu", "Delhi",
+  "Goa", "Gujarat", "Haryana", "Himachal Pradesh", "Jammu and Kashmir", "Jharkhand",
+  "Karnataka", "Kerala", "Madhya Pradesh", "Maharashtra", "Manipur", "Meghalaya",
+  "Mizoram", "Nagaland", "Odisha", "Puducherry", "Punjab", "Rajasthan", "Sikkim",
+  "Tamil Nadu", "Telangana", "Tripura", "Uttar Pradesh", "Uttrakhand", "West Bengal"
+]
+
 const progressSchema = new mongoose.Schema({
   id: { type: String, default: 'scraper_progress' },
-  offset: { type: Number, default: 0 },
-  part: { type: Number, default: 1 },
-  rowCount: { type: Number, default: 0 },
+  stateIndex: { type: Number, default: 0 },
+  offset: { type: Number, default: 0 }
 })
 const Progress = mongoose.model('Progress', progressSchema)
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms))
-}
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)) }
 
-async function fetchData(offset) {
-  const url = `https://api.data.gov.in/resource/${RESOURCE_ID}?api-key=${API_KEY}&format=json&limit=${LIMIT}&offset=${offset}`
+// --- FETCH DATA WITH INFINITE RETRY ---
+async function fetchData(offset, stateName) {
+  const url = `https://api.data.gov.in/resource/${RESOURCE_ID}?api-key=${API_KEY}&format=json&limit=${LIMIT}&offset=${offset}&filters[state]=${encodeURIComponent(stateName)}`
   while (true) {
     try {
-      const res = await axios.get(url, { timeout: 120000 })
+      const res = await axios.get(url, { timeout: 60000 })
       return res.data.records || []
     } catch (err) {
-      process.stdout.write(
-        `\n🔄 Offset ${offset} is stuck (Error: ${err.message}). Retrying in 10s...`,
-      )
-      await sleep(10000)
+      process.stdout.write(`\n⏳ [${new Date().toLocaleTimeString()}] API Busy at ${stateName}. Retrying...`)
+      await sleep(30000)
     }
   }
 }
 
-async function uploadChunk(drive, pass, part) {
+// --- GOOGLE DRIVE UPLOAD ---
+async function uploadChunk(drive, pass, stateName) {
   try {
+    const fileName = `mandi_${stateName.replace(/ /g, '_')}_FULL.csv`;
     const res = await drive.files.create({
-      requestBody: {
-        name: `mandi_dataset_part${part}.csv`,
-        parents: [FOLDER_ID],
-      },
+      requestBody: { name: fileName, parents: [FOLDER_ID] },
       media: { mimeType: 'text/csv', body: pass },
       fields: 'id',
       supportsAllDrives: true,
     })
-    console.log(`\n✅ Drive file uploaded! Part: ${part} | ID: ${res.data.id}`)
+    console.log(`\n✅ [FILE SAVED] ${fileName} is now on Google Drive! ID: ${res.data.id}`)
   } catch (err) {
-    console.log('\n❌ Drive Upload Error:', err.message)
+    console.log('\n❌ Drive Error:', err.message)
   }
 }
 
 async function start() {
-  console.log(`🚀 Connecting to MongoDB...`)
   await mongoose.connect(MONGO_URI)
-  console.log(`✅ MongoDB Connected!`)
+  console.log(`🚀 Scraper Started! Har State ki alag file Google Drive par jayegi.\n`)
 
-  // --- PROGRESS LOGIC ---
-  let state = await Progress.findOne({ id: 'scraper_progress' })
-  if (!state) {
-    console.log(
-      '📍 No previous progress found. Starting from Part 4 / Offset 15,00,000.',
-    )
-    state = await Progress.create({
-      id: 'scraper_progress',
-      offset: 1500000,
-      part: 4,
-      rowCount: 0,
-    })
-  }
+  let prog = await Progress.findOne({ id: 'scraper_progress' })
+  if (!prog) prog = await Progress.create({ id: 'scraper_progress' })
 
-  // --- DYNAMIC AUTH SETUP ---
-  let credentials, token
+  // Auth setup (Local files or Env)
+  let credentials, token;
   try {
-    // Railway Variables se check karega, nahi toh local file se
-    credentials = process.env.GOOGLE_CREDENTIALS
-      ? JSON.parse(process.env.GOOGLE_CREDENTIALS)
-      : JSON.parse(fs.readFileSync('credentials.json', 'utf8'))
-
-    token = process.env.GOOGLE_TOKEN
-      ? JSON.parse(process.env.GOOGLE_TOKEN)
-      : JSON.parse(fs.readFileSync('token.json', 'utf8'))
-
-    console.log('🔑 Auth Credentials loaded successfully.')
+    credentials = process.env.GOOGLE_CREDENTIALS ? JSON.parse(process.env.GOOGLE_CREDENTIALS) : JSON.parse(fs.readFileSync('credentials.json', 'utf8'));
+    token = process.env.GOOGLE_TOKEN ? JSON.parse(process.env.GOOGLE_TOKEN) : JSON.parse(fs.readFileSync('token.json', 'utf8'));
   } catch (e) {
-    console.error(
-      '❌ FATAL: Credentials or Token missing in Variables AND Files!',
-    )
-    process.exit(1)
+    console.error('❌ Error: credentials.json or token.json missing locally!');
+    process.exit(1);
   }
 
-  const { client_secret, client_id, redirect_uris } =
-    credentials.installed || credentials.web
-  const oAuth2Client = new google.auth.OAuth2(
-    client_id,
-    client_secret,
-    redirect_uris[0],
-  )
+  const { client_secret, client_id, redirect_uris } = credentials.installed || credentials.web
+  const oAuth2Client = new google.auth.OAuth2(client_id, client_secret, redirect_uris[0])
   oAuth2Client.setCredentials(token)
   const drive = google.drive({ version: 'v3', auth: oAuth2Client })
 
-  let { offset, part, rowCount } = state
-  let headerWritten = false
-  let pass = new stream.PassThrough()
+  let { stateIndex, offset } = prog
 
-  console.log(
-    `📍 Resuming from DB -> Offset: ${offset} | Part: ${part} | Chunk: ${rowCount}`,
-  )
+  while (stateIndex < STATES.length) {
+    const currentState = STATES[stateIndex]
+    console.log(`\n🌍 --- Processing State: ${currentState} (${stateIndex + 1}/${STATES.length}) ---`)
 
-  while (true) {
-    const tasks = []
-    for (let i = 0; i < NUM_WORKERS; i++) {
-      const currentOffset = offset + i * LIMIT
-      tasks.push(
-        fetchData(currentOffset).then((records) => ({
-          offset: currentOffset,
-          records,
-        })),
-      )
+    let pass = new stream.PassThrough()
+    let headerWritten = false
+    let stateRowCount = 0
+
+    // Nayi file ka upload stream shuru karein
+    const uploadPromise = uploadChunk(drive, pass, currentState)
+
+    while (true) {
+      const records = await fetchData(offset, currentState)
+
+      if (records.length === 0) {
+        // Double check taaki data miss na ho
+        await sleep(20000)
+        const check = await fetchData(offset, currentState)
+        if (check.length === 0) break
+      }
+
+      // --- LIVE CONSOLE LOGGING ---
+      stateRowCount += records.length;
+      console.log(`[${new Date().toLocaleTimeString()}] 📥 Received: +${records.length} rows | Total for ${currentState}: ${stateRowCount} | Offset: ${offset}`);
+
+      if (!headerWritten) {
+        pass.write(Object.keys(records[0]).join(',') + '\n')
+        headerWritten = true
+      }
+
+      const rows = records.map(r => Object.values(r).map(v => `"${v}"`).join(',')).join('\n')
+      pass.write(rows + '\n')
+
+      offset += LIMIT
+
+      // Update progress in DB
+      await Progress.updateOne({ id: 'scraper_progress' }, { offset, stateIndex })
+
+      await sleep(2000) // Delay to prevent IP block
     }
 
-    const results = await Promise.all(tasks)
-    const allRecords = []
-    for (const result of results) {
-      if (result.records.length > 0) allRecords.push(...result.records)
-    }
-
-   if (allRecords.length === 0) {
-      // Ab ye band nahi hoga, balki 1 minute wait karke phir try karega
-      console.log('\n⏳ No data received or API limit reached. Waiting 1 minute before retrying...');
-      await sleep(60000);
-      continue; // Yeh line scraper ko band hone se rokegi aur wapas loop chalayegi
-    }
-
-    if (!headerWritten && allRecords.length > 0) {
-      pass.write(Object.keys(allRecords[0]).join(',') + '\n')
-      headerWritten = true
-    }
-
-    const rows = allRecords
-      .map((r) =>
-        Object.values(r)
-          .map((v) => `"${v}"`)
-          .join(','),
-      )
-      .join('\n')
-    pass.write(rows + '\n')
-
-    offset += NUM_WORKERS * LIMIT
-    rowCount += allRecords.length
-
-    await Progress.updateOne(
-      { id: 'scraper_progress' },
-      { offset, rowCount, part },
-    )
-
-    process.stdout.write(
-      `\r📊 Rows Processed: ${offset} | Part: ${part} | Current Chunk: ${rowCount}`,
-    )
-
-    if (rowCount >= CHUNK_SIZE) {
-      pass.end()
-      await uploadChunk(drive, pass, part)
-      part++
-      rowCount = 0
-      await Progress.updateOne(
-        { id: 'scraper_progress' },
-        { part, rowCount: 0 },
-      )
-      pass = new stream.PassThrough()
-      headerWritten = false
-    }
-    await sleep(2000)
-  }
-
-  if (rowCount > 0) {
+    // State khatam, stream close karein
     pass.end()
-    await uploadChunk(drive, pass, part)
+    await uploadPromise
+
+    console.log(`\n🎉 Finished ${currentState}. Moving to next state...`)
+
+    // Agli state ke liye reset
+    stateIndex++
+    offset = 0
+    await Progress.updateOne({ id: 'scraper_progress' }, { stateIndex, offset: 0 })
   }
+  console.log("\n🏁 MISSION ACCOMPLISHED: 7.7 CR DATA SCRAPED STATE-WISE!")
 }
 
-start().catch((err) => console.error('FATAL ERROR:', err))
+start().catch(err => console.error(err))
