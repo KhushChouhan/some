@@ -10,148 +10,99 @@ const RESOURCE_ID = '35985678-0d79-46b4-9ed6-6f13308a1d24'
 const LIMIT = 5000
 const CHUNK_SIZE = 500000
 const FOLDER_ID = '1TNYEd-5CCzypE-mYfSsBH7yzr9iH7_Z2'
-const NUM_WORKERS = 2 // Workers kam rakhein stable connection ke liye
+const NUM_WORKERS = 4 
 
 const STORAGE_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || './data'
-
-if (!fs.existsSync(STORAGE_DIR)) {
-  fs.mkdirSync(STORAGE_DIR, { recursive: true })
-}
+if (!fs.existsSync(STORAGE_DIR)) fs.mkdirSync(STORAGE_DIR, { recursive: true })
 
 const OFFSET_FILE = path.join(STORAGE_DIR, 'offset.txt')
 const PART_FILE = path.join(STORAGE_DIR, 'part.txt')
+const CHUNK_FILE = path.join(STORAGE_DIR, 'chunk.txt')
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms))
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)) }
+
+function getSavedValue(file, defaultVal) {
+  if (fs.existsSync(file)) return parseInt(fs.readFileSync(file, 'utf8').trim()) || defaultVal
+  return defaultVal
 }
 
-function getOffset() {
-  if (fs.existsSync(OFFSET_FILE)) {
-    return parseInt(fs.readFileSync(OFFSET_FILE, 'utf8').trim()) || 0
+// --- MODIFIED FETCH DATA (INFINITE RETRY) ---
+async function fetchData(offset) {
+  const url = `https://api.data.gov.in/resource/${RESOURCE_ID}?api-key=${API_KEY}&format=json&limit=${LIMIT}&offset=${offset}`
+  
+  while (true) { // Yeh loop tab tak chalega jab tak data na mil jaye
+    try {
+      const res = await axios.get(url, { timeout: 120000 })
+      return res.data.records || []
+    } catch (err) {
+      console.log(`\n🔄 Retrying offset ${offset}: ${err.message}... (Waiting for data)`)
+      await sleep(10000) // Error aane par 10 second wait karega
+      // Loop continue hoga, break nahi
+    }
   }
-  return 0
-}
-
-function saveOffset(offset) {
-  fs.writeFileSync(OFFSET_FILE, offset.toString())
-}
-
-function getPart() {
-  if (fs.existsSync(PART_FILE)) {
-    return parseInt(fs.readFileSync(PART_FILE, 'utf8').trim()) || 1
-  }
-  return 1
-}
-
-function savePart(part) {
-  fs.writeFileSync(PART_FILE, part.toString())
 }
 
 async function uploadChunk(drive, pass, part) {
   try {
     const res = await drive.files.create({
-      requestBody: {
-        name: `mandi_dataset_part${part}.csv`,
-        parents: [FOLDER_ID],
-      },
-      media: {
-        mimeType: 'text/csv',
-        body: pass,
-      },
+      requestBody: { name: `mandi_dataset_part${part}.csv`, parents: [FOLDER_ID] },
+      media: { mimeType: 'text/csv', body: pass },
       fields: 'id',
       supportsAllDrives: true,
     })
-    console.log(`\n✅ Drive file created: ${res.data.id} (part ${part})`)
+    console.log(`\n✅ Drive file uploaded: (part ${part}) ID: ${res.data.id}`)
+    fs.writeFileSync(CHUNK_FILE, '0')
   } catch (err) {
     console.log('\n❌ Drive Upload Error:', err.message)
   }
 }
 
-// Retries default 15 set kar di hai
-async function fetchData(offset, retries = 15) {
-  const url = `https://api.data.gov.in/resource/${RESOURCE_ID}?api-key=${API_KEY}&format=json&limit=${LIMIT}&offset=${offset}`
-  for (let attempt = 0; attempt < retries; attempt++) {
-    try {
-      const res = await axios.get(url, { timeout: 120000 })
-      return res.data.records || []
-    } catch (err) {
-      if (err.response && err.response.status === 429) {
-        console.log(`\n⏳ Rate limited at offset ${offset}, waiting 15s...`)
-        await sleep(15000)
-      } else {
-        console.log(`\n🔄 Retry ${attempt + 1}/${retries} at offset ${offset}: ${err.message}`)
-        await sleep(5000) // Sleep thoda badha diya hai error par
-      }
-      if (attempt === retries - 1) return null // null return karenge taaki pata chale error hua hai
-    }
-  }
-  return null
-}
-
 async function start() {
-  console.log(`🚀 Railway Scraper Initializing...`)
+  console.log(`🚀 Scraper Starting (Infinite Retry Mode)...`)
 
   let credentials, token
   try {
     credentials = process.env.GOOGLE_CREDENTIALS ? JSON.parse(process.env.GOOGLE_CREDENTIALS) : JSON.parse(fs.readFileSync('credentials.json'))
     token = process.env.GOOGLE_TOKEN ? JSON.parse(process.env.GOOGLE_TOKEN) : JSON.parse(fs.readFileSync('token.json'))
-  } catch (e) {
-    console.error('❌ Auth Error: credentials.json or token.json missing!')
-    process.exit(1)
-  }
+  } catch (e) { console.error('❌ Auth Error'); process.exit(1) }
 
   const { client_secret, client_id, redirect_uris } = credentials.installed || credentials.web
   const oAuth2Client = new google.auth.OAuth2(client_id, client_secret, redirect_uris[0])
   oAuth2Client.setCredentials(token)
-
   const drive = google.drive({ version: 'v3', auth: oAuth2Client })
 
-  let offset = getOffset()
-  let part = getPart()
-  let rowCount = 0
+  let offset = getSavedValue(OFFSET_FILE, 0)
+  let part = getSavedValue(PART_FILE, 1)
+  let rowCount = getSavedValue(CHUNK_FILE, 0)
   let headerWritten = offset > 0
-  let pass = null
+  let pass = new stream.PassThrough()
 
-  console.log(`📍 Starting from offset: ${offset} | Part: ${part}`)
+  console.log(`📍 Resume Point -> Offset: ${offset} | Part: ${part} | Chunk: ${rowCount}`)
 
   while (true) {
     const tasks = []
     for (let i = 0; i < NUM_WORKERS; i++) {
       const currentOffset = offset + i * LIMIT
-      // Yahan fetchData ko 15 retries ke saath call kiya hai
-      tasks.push(fetchData(currentOffset, 15).then(records => ({ offset: currentOffset, records })))
+      tasks.push(fetchData(currentOffset).then(records => ({ offset: currentOffset, records })))
     }
 
     const results = await Promise.all(tasks)
-    let validResponseInBatch = false
     const allRecords = []
 
     for (const result of results) {
-      if (result.records !== null) {
-        validResponseInBatch = true // Agar ek bhi worker ne data (ya empty array) diya toh true
-        if (result.records.length > 0) {
-          allRecords.push(...result.records)
-        }
+      if (result.records.length > 0) {
+        allRecords.push(...result.records)
       }
     }
 
-    // Agar saare workers ne null (final failure) diya toh hi break karein
-    if (!validResponseInBatch) {
-      console.log('\n⚠️ API non-responsive after many retries. Stopping to save credits.')
+    // Agar real mein data khatam ho gaya (Govt database end)
+    if (allRecords.length === 0) {
+      console.log('\n🏁 Reach end of Database.')
       break
     }
 
-    // Agar records khali hain (Real end of data)
-    if (allRecords.length === 0 && validResponseInBatch) {
-       console.log('\n✅ Reached end of available data.')
-       break
-    }
-
-    if (!pass) pass = new stream.PassThrough()
-
     if (!headerWritten && allRecords.length > 0) {
-      const header = Object.keys(allRecords[0]).join(',')
-      pass.write(header + '\n')
+      pass.write(Object.keys(allRecords[0]).join(',') + '\n')
       headerWritten = true
     }
 
@@ -160,27 +111,28 @@ async function start() {
 
     offset += NUM_WORKERS * LIMIT
     rowCount += allRecords.length
-    saveOffset(offset)
+    
+    fs.writeFileSync(OFFSET_FILE, offset.toString())
+    fs.writeFileSync(CHUNK_FILE, rowCount.toString()) 
 
-    process.stdout.write(`\r📊 Rows: ${offset} | Part: ${part} | Chunk: ${rowCount}`)
+    process.stdout.write(`\r📊 Total: ${offset} | Part: ${part} | Chunk: ${rowCount}`)
 
     if (rowCount >= CHUNK_SIZE) {
       pass.end()
       await uploadChunk(drive, pass, part)
       part++
-      savePart(part)
+      fs.writeFileSync(PART_FILE, part.toString())
       rowCount = 0
+      fs.writeFileSync(CHUNK_FILE, '0')
       pass = new stream.PassThrough()
     }
-
-    await sleep(2000) // 2 second ka gap API ko saans lene ke liye
+    await sleep(2000)
   }
 
-  if (pass) {
+  if (rowCount > 0) {
     pass.end()
     await uploadChunk(drive, pass, part)
   }
-  console.log('\n🎊 Scraping complete!')
 }
 
 start()
