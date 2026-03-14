@@ -10,8 +10,9 @@ const RESOURCE_ID = '35985678-0d79-46b4-9ed6-6f13308a1d24'
 const LIMIT = 5000
 const CHUNK_SIZE = 500000
 const FOLDER_ID = '1TNYEd-5CCzypE-mYfSsBH7yzr9iH7_Z2'
-const NUM_WORKERS = 4 
+const NUM_WORKERS = 4
 
+// Railway Volume Path
 const STORAGE_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || './data'
 if (!fs.existsSync(STORAGE_DIR)) fs.mkdirSync(STORAGE_DIR, { recursive: true })
 
@@ -22,22 +23,25 @@ const CHUNK_FILE = path.join(STORAGE_DIR, 'chunk.txt')
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)) }
 
 function getSavedValue(file, defaultVal) {
-  if (fs.existsSync(file)) return parseInt(fs.readFileSync(file, 'utf8').trim()) || defaultVal
+  if (fs.existsSync(file)) {
+    const val = fs.readFileSync(file, 'utf8').trim()
+    return val ? parseInt(val) : defaultVal
+  }
   return defaultVal
 }
 
-// --- MODIFIED FETCH DATA (INFINITE RETRY) ---
+// --- INFINITE RETRY FETCH ---
 async function fetchData(offset) {
   const url = `https://api.data.gov.in/resource/${RESOURCE_ID}?api-key=${API_KEY}&format=json&limit=${LIMIT}&offset=${offset}`
-  
-  while (true) { // Yeh loop tab tak chalega jab tak data na mil jaye
+
+  while (true) {
     try {
       const res = await axios.get(url, { timeout: 120000 })
       return res.data.records || []
     } catch (err) {
-      console.log(`\n🔄 Retrying offset ${offset}: ${err.message}... (Waiting for data)`)
-      await sleep(10000) // Error aane par 10 second wait karega
-      // Loop continue hoga, break nahi
+      // Yahan se 1/5 hata diya gaya hai
+      process.stdout.write(`\n🔄 Offset ${offset} is stuck (Error: ${err.message}). Retrying in 10s...`)
+      await sleep(10000)
     }
   }
 }
@@ -50,7 +54,8 @@ async function uploadChunk(drive, pass, part) {
       fields: 'id',
       supportsAllDrives: true,
     })
-    console.log(`\n✅ Drive file uploaded: (part ${part}) ID: ${res.data.id}`)
+    console.log(`\n✅ Drive file uploaded! Part: ${part} | ID: ${res.data.id}`)
+    // Reset chunk count after successful upload
     fs.writeFileSync(CHUNK_FILE, '0')
   } catch (err) {
     console.log('\n❌ Drive Upload Error:', err.message)
@@ -58,13 +63,16 @@ async function uploadChunk(drive, pass, part) {
 }
 
 async function start() {
-  console.log(`🚀 Scraper Starting (Infinite Retry Mode)...`)
+  console.log(`🚀 Scraper Started (Fixed Infinite Retry & Chunk Resume)`)
 
   let credentials, token
   try {
     credentials = process.env.GOOGLE_CREDENTIALS ? JSON.parse(process.env.GOOGLE_CREDENTIALS) : JSON.parse(fs.readFileSync('credentials.json'))
     token = process.env.GOOGLE_TOKEN ? JSON.parse(process.env.GOOGLE_TOKEN) : JSON.parse(fs.readFileSync('token.json'))
-  } catch (e) { console.error('❌ Auth Error'); process.exit(1) }
+  } catch (e) {
+    console.error('❌ Auth Error: Check credentials.json or Railway Variables')
+    process.exit(1)
+  }
 
   const { client_secret, client_id, redirect_uris } = credentials.installed || credentials.web
   const oAuth2Client = new google.auth.OAuth2(client_id, client_secret, redirect_uris[0])
@@ -77,12 +85,12 @@ async function start() {
   let headerWritten = offset > 0
   let pass = new stream.PassThrough()
 
-  console.log(`📍 Resume Point -> Offset: ${offset} | Part: ${part} | Chunk: ${rowCount}`)
+  console.log(`📍 Resuming from -> Offset: ${offset} | Part: ${part} | Rows already in chunk: ${rowCount}`)
 
   while (true) {
     const tasks = []
     for (let i = 0; i < NUM_WORKERS; i++) {
-      const currentOffset = offset + i * LIMIT
+      const currentOffset = offset + (i * LIMIT)
       tasks.push(fetchData(currentOffset).then(records => ({ offset: currentOffset, records })))
     }
 
@@ -95,9 +103,9 @@ async function start() {
       }
     }
 
-    // Agar real mein data khatam ho gaya (Govt database end)
+    // End of data check
     if (allRecords.length === 0) {
-      console.log('\n🏁 Reach end of Database.')
+      console.log('\n🏁 Database End Reached.')
       break
     }
 
@@ -109,24 +117,29 @@ async function start() {
     const rows = allRecords.map(r => Object.values(r).map(v => `"${v}"`).join(',')).join('\n')
     pass.write(rows + '\n')
 
-    offset += NUM_WORKERS * LIMIT
+    offset += (NUM_WORKERS * LIMIT)
     rowCount += allRecords.length
-    
-    fs.writeFileSync(OFFSET_FILE, offset.toString())
-    fs.writeFileSync(CHUNK_FILE, rowCount.toString()) 
 
-    process.stdout.write(`\r📊 Total: ${offset} | Part: ${part} | Chunk: ${rowCount}`)
+    // Save progress to volume
+    fs.writeFileSync(OFFSET_FILE, offset.toString())
+    fs.writeFileSync(CHUNK_FILE, rowCount.toString())
+    fs.writeFileSync(PART_FILE, part.toString())
+
+    process.stdout.write(`\r📊 Rows Processed: ${offset} | Part: ${part} | Current Chunk: ${rowCount}`)
 
     if (rowCount >= CHUNK_SIZE) {
       pass.end()
       await uploadChunk(drive, pass, part)
+
       part++
       fs.writeFileSync(PART_FILE, part.toString())
       rowCount = 0
       fs.writeFileSync(CHUNK_FILE, '0')
+
       pass = new stream.PassThrough()
+      headerWritten = false // New file needs a new header
     }
-    await sleep(2000)
+    await sleep(1500)
   }
 
   if (rowCount > 0) {
