@@ -16,7 +16,7 @@ const MONGO_URI =
 const LIMIT = 5000
 const CHUNK_SIZE = 500000
 const FOLDER_ID = '1TNYEd-5CCzypE-mYfSsBH7yzr9iH7_Z2'
-const NUM_WORKERS = 4
+const NUM_WORKERS = 2
 
 // --- MONGODB SCHEMA ---
 const progressSchema = new mongoose.Schema({
@@ -138,9 +138,11 @@ async function start() {
       if (result.records.length > 0) allRecords.push(...result.records)
     }
 
-    if (allRecords.length === 0) {
-      console.log('\n🏁 Database End Reached.')
-      break
+   if (allRecords.length === 0) {
+      // Ab ye band nahi hoga, balki 1 minute wait karke phir try karega
+      console.log('\n⏳ No data received or API limit reached. Waiting 1 minute before retrying...');
+      await sleep(60000);
+      continue; // Yeh line scraper ko band hone se rokegi aur wapas loop chalayegi
     }
 
     if (!headerWritten && allRecords.length > 0) {
