@@ -11,6 +11,7 @@ const API_KEY =
 const RESOURCE_ID = '35985678-0d79-46b4-9ed6-6f13308a1d24'
 // Aapka MongoDB Connection String
 const MONGO_URI =
+  process.env.MONGO_URI ||
   'mongodb+srv://khushchouhan9680_db_user:9680796461@cluster0.2xwtrmi.mongodb.net/mandi_scraper?retryWrites=true&w=majority'
 
 const LIMIT = 5000
